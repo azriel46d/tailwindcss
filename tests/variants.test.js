@@ -24,6 +24,27 @@ test('variants', () => {
   })
 })
 
+// Input: group-hover:group-focus
+// Output: .group:hover .group:focus .md\:group
+// Expected: .group:hover:focus .md\:group
+// Potential solution: {.group}
+
+it('should work', () => {
+  let config = {
+    content: [{ raw: 'focus:hover:space-x-4' }],
+  }
+
+  return run('@tailwind utilities', config).then((result) => {
+    return expect(result.css).toMatchFormattedCss(css`
+      .focus\\:hover\\:space-x-4:hover:focus > :not([hidden]) ~ :not([hidden]) {
+        --tw-space-x-reverse: 0;
+        margin-right: calc(1rem * var(--tw-space-x-reverse));
+        margin-left: calc(1rem * calc(1 - var(--tw-space-x-reverse)));
+      }
+    `)
+  })
+})
+
 test('stacked peer variants', async () => {
   let config = {
     content: [{ raw: 'peer-disabled:peer-focus:peer-hover:border-blue-500' }],

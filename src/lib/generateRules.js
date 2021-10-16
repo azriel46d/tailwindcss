@@ -5,6 +5,7 @@ import isPlainObject from '../util/isPlainObject'
 import prefixSelector from '../util/prefixSelector'
 import { updateAllClasses } from '../util/pluginUtils'
 import log from '../util/log'
+import { formatVariantSelector, finalizeSelector } from '../util/formatVariantSelector'
 
 let classNameParser = selectorParser((selectors) => {
   return selectors.first.filter(({ type }) => type === 'class').pop().value
@@ -89,66 +90,126 @@ function applyImportant(matches) {
   return result
 }
 
-// Takes a list of rule tuples and applies a variant like `hover`, sm`,
-// whatever to it. We used to do some extra caching here to avoid generating
-// a variant of the same rule more than once, but this was never hit because
-// we cache at the entire selector level further up the tree.
-//
-// Technically you can get a cache hit if you have `hover:focus:text-center`
-// and `focus:hover:text-center` in the same project, but it doesn't feel
-// worth the complexity for that case.
-
 function applyVariant(variant, matches, context) {
   if (matches.length === 0) {
     return matches
   }
 
-  if (context.variantMap.has(variant)) {
-    let variantFunctionTuples = context.variantMap.get(variant)
-    let result = []
+  if (!context.variantMap.has(variant)) {
+    return []
+  }
+  let variantFunctionTuples = context.variantMap.get(variant)
+  let result = []
 
-    for (let [meta, rule] of matches) {
-      let container = postcss.root({ nodes: [rule.clone()] })
+  for (let [meta, rule] of matches) {
+    let container = postcss.root({ nodes: [rule.clone()] })
 
-      for (let [variantSort, variantFunction] of variantFunctionTuples) {
-        let clone = container.clone()
-        function modifySelectors(modifierFunction) {
-          clone.each((rule) => {
-            if (rule.type !== 'rule') {
-              return
-            }
+    for (let [variantSort, variantFunction] of variantFunctionTuples) {
+      let clone = container.clone()
+      let collectedFormats = []
 
-            rule.selectors = rule.selectors.map((selector) => {
-              return modifierFunction({
-                get className() {
-                  return getClassNameFromSelector(selector)
-                },
-                selector,
-              })
+      let originals = new Map()
+
+      function prepareBackup() {
+        if (originals.size > 0) return // Already prepared, chicken out
+        clone.walkRules((rule) => originals.set(rule, rule.selector))
+      }
+
+      function modifySelectors(modifierFunction) {
+        prepareBackup()
+        clone.each((rule) => {
+          if (rule.type !== 'rule') {
+            return
+          }
+
+          rule.selectors = rule.selectors.map((selector) => {
+            return modifierFunction({
+              get className() {
+                return getClassNameFromSelector(selector)
+              },
+              selector,
             })
           })
-          return clone
-        }
-
-        let ruleWithVariant = variantFunction({
-          container: clone,
-          separator: context.tailwindConfig.separator,
-          modifySelectors,
         })
 
-        if (ruleWithVariant === null) {
-          continue
-        }
-
-        let withOffset = [{ ...meta, sort: variantSort | meta.sort }, clone.nodes[0]]
-        result.push(withOffset)
+        return clone
       }
-    }
 
-    return result
+      let ruleWithVariant = variantFunction({
+        get container() {
+          prepareBackup()
+          return clone
+        },
+        separator: context.tailwindConfig.separator,
+        modifySelectors,
+        wrap(wrapper) {
+          let nodes = clone.nodes
+          clone.removeAll()
+          wrapper.append(nodes)
+          clone.append(wrapper)
+        },
+        withRule(modify) {
+          clone.walkRules(modify)
+        },
+        format(selectorFormat) {
+          collectedFormats.push(selectorFormat)
+        },
+      })
+
+      if (ruleWithVariant === null) {
+        continue
+      }
+
+      // We filled the `originals`, therefore we assume that somebody touched
+      // `container` or `modifySelectors`. Let's see if they did, so that we
+      // can restore the selectors, and collect the format strings.
+      if (originals.size > 0) {
+        clone.walkRules((rule) => {
+          if (!originals.has(rule)) return
+          let before = originals.get(rule)
+          if (before === rule.selector) return // No mutation happened
+
+          let modified = rule.selector
+
+          // Rebuild the base selector, this is what plugin authors would do
+          // as well. E.g.: `${variant}${separator}${className}`.
+          // However, plugin authors probably also prepend or append certain
+          // classes, pseudos, ids, ...
+          let rebuiltBase = selectorParser((selectors) => {
+            selectors.walkClasses((classNode) => {
+              classNode.value = `${variant}${context.tailwindConfig.separator}${classNode.value}`
+            })
+          }).processSync(before)
+
+          // Now that we know the original selector, the new selector, and
+          // the rebuild part in between, we can replace the part that plugin
+          // authors need to rebuild with `&`, and eventually store it in the
+          // collectedFormats. Similar to what `format('...')` would do.
+          //
+          // E.g.:
+          //                   variant: foo
+          //                  selector: .markdown > p
+          //      modified (by plugin): .foo .foo\\:markdown > p
+          //    rebuiltBase (internal): .foo\\:markdown > p
+          //                    format: .foo &
+          collectedFormats.push(modified.replace(rebuiltBase, '&'))
+          rule.selector = before
+        })
+      }
+
+      let withOffset = [
+        {
+          ...meta,
+          sort: variantSort | meta.sort,
+          collectedFormats: (meta.collectedFormats ?? []).concat(collectedFormats),
+        },
+        clone.nodes[0],
+      ]
+      result.push(withOffset)
+    }
   }
 
-  return []
+  return result
 }
 
 function parseRules(rule, cache, options = {}) {
@@ -323,6 +384,23 @@ function* resolveMatches(candidate, context) {
     }
 
     for (let match of matches) {
+      if (match[0].collectedFormats) {
+        // Apply final format selector
+        let finalFormat = formatVariantSelector('&', ...match[0].collectedFormats)
+        let container = postcss.root({ nodes: [match[1].clone()] })
+        container.walkRules((rule) => {
+          if (inKeyframes(rule)) return
+
+          rule.selector = finalizeSelector(finalFormat, {
+            selector: rule.selector,
+            candidate,
+            context,
+          })
+        })
+        delete match[0].collectedFormats
+        match[1] = container.nodes[0]
+      }
+
       yield match
     }
   }
